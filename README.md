@@ -1,15 +1,18 @@
 # AAVA Python Migration UI
 
-A Streamlit interface for running the AAVA Python migration workflow.
+A Streamlit interface for running the complete AAVA Python migration workflow
+or running documentation-focused AAVA agents independently.
 
-The application reproduces the working request imported into Postman from the
-AAVA browser Inspect tool.
+The app has three top-level tabs:
 
-## Request format
+- **Full Workflow** runs the existing end-to-end migration workflow.
+- **Repository Analyzer** runs only the Repository Analyzer Agent.
+- **Python Migration** runs only the Python Migration Agent.
 
-The application sends a POST request using `multipart/form-data`.
+## Request formats
 
-The request contains exactly three form fields:
+The **Full Workflow** tab preserves the original workflow request. It sends a
+`multipart/form-data` POST with exactly these fields:
 
 - `pipelineId`
 - `userInputs`
@@ -21,21 +24,45 @@ It also sends the AAVA API token using the Authorization header:
 Authorization: Bearer <AAVA_TOKEN>
 ```
 
-The GitHub personal access token is entered in the UI for each workflow run
-and securely inserted into the `github_config` workflow input.
+The full workflow still asks the user to enter a GitHub personal access token
+in the UI for each run. That token is inserted into the existing nested
+`github_config` workflow input and is never displayed in request previews.
+
+The **Repository Analyzer** and **Python Migration** tabs use the standalone
+AAVA agent endpoint. These requests are JSON POST requests to
+`AAVA_AGENT_EXECUTION_URL`. They are synchronous and can take one to several
+minutes to return the completed response. The app waits for the HTTP response
+and does not poll.
+
+Standalone agent reports are extracted from the final Markdown `output` field.
+The app supports both observed AAVA response shapes:
+
+```text
+data.agentResponse.output
+data.agentResponse.agent.output
+data.output
+output
+```
+
+The extracted value is rendered as Markdown and can be downloaded as a `.md`
+file. Agent outputs are kept only in Streamlit session state and are not
+automatically written to disk.
 
 ## Project structure
 
 ```text
 aava-workflow-ui/
-├── app.py
-├── aava_client.py
-├── requirements.txt
-├── README.md
-├── .gitignore
-└── .streamlit/
-    ├── secrets.toml
-    └── secrets.toml.example
+|-- app.py
+|-- aava_client.py
+|-- aava_agent_client.py
+|-- requirements.txt
+|-- README.md
+|-- .gitignore
+|-- .streamlit/
+|   |-- secrets.toml
+|   `-- secrets.toml.example
+`-- tests/
+    `-- test_aava_agent_client.py
 ```
 
 ## Setup
@@ -72,14 +99,21 @@ Open:
 .streamlit/secrets.toml
 ```
 
-Add the exact values from the working Postman request:
+Add placeholder-free values copied from your working AAVA/Postman requests:
 
 ```toml
 AAVA_WORKFLOW_URL = "YOUR_WORKFLOW_EXECUTION_URL"
+AAVA_AGENT_EXECUTION_URL = "PASTE_EXACT_AGENT_EXECUTION_URL_FROM_POSTMAN"
 AAVA_PIPELINE_ID = "YOUR_PIPELINE_ID"
 AAVA_PRIORITY = "1"
 AAVA_BEARER_TOKEN = "YOUR_AAVA_TOKEN"
+AAVA_USER_EMAIL = "your.name@ascendion.com"
+AAVA_REPO_ANALYZER_AGENT_ID = "45881"
+AAVA_PYTHON_MIGRATION_AGENT_ID = "45878"
 ```
+
+Do not put a GitHub token in `.streamlit/secrets.toml`. The Full Workflow tab
+asks each user to enter their own GitHub token for each workflow run.
 
 ## Run the application
 
@@ -87,30 +121,30 @@ AAVA_BEARER_TOKEN = "YOUR_AAVA_TOKEN"
 streamlit run app.py
 ```
 
-Streamlit should open the application in a browser.
-
-The default local address is usually:
+Streamlit should open the application in a browser. The default local address
+is usually:
 
 ```text
 http://localhost:8501
 ```
 
-## Workflow inputs
+## Full Workflow tab
+
+The Full Workflow tab runs all four workflow agents through the existing AAVA
+workflow endpoint.
 
 The UI collects:
 
 - GitHub repository URL
-- GitHub personal access token
 - Source branch
 - Target Python version
+- GitHub personal access token
 - Target branch
 - Commit message
 
-Use a GitHub token that can read the source repository and create or update
-the target branch.
-
-The application builds the AAVA `userInputs` object using the exact workflow
-variable names:
+Use a GitHub token that can read the source repository and create or update the
+target branch. The app builds the AAVA `userInputs` object using the existing
+workflow variable names:
 
 ```text
 {{repo_url_string_true}}
@@ -126,8 +160,32 @@ variable names:
 {{migration_agent_output_string_true}}
 ```
 
-The intermediate workflow values are submitted as empty strings and populated
-during workflow execution.
+## Repository Analyzer tab
+
+The Repository Analyzer tab runs agent ID `45881` independently. It collects:
+
+- GitHub repository URL
+- Source branch
+- Target Python version
+
+The standalone agent does not require a GitHub token. The report is displayed
+as rendered Markdown and can be downloaded as `repository-analysis.md`.
+
+## Python Migration tab
+
+The Python Migration tab runs agent ID `45878` independently. It requires the
+complete Repository Analyzer Markdown report and a target Python version.
+
+The analyzer report can come from:
+
+- The latest Repository Analyzer run in the current Streamlit session
+- Pasted Markdown
+- An uploaded `.md` or `.txt` file
+
+The standalone Python Migration Agent does not require a GitHub token,
+repository URL, branch, target branch, or commit message. The report is
+displayed as rendered Markdown and can be downloaded as
+`python-migration-report.md`.
 
 ## Security
 
@@ -139,20 +197,20 @@ Never commit:
 
 The `.gitignore` file excludes it automatically.
 
-The GitHub personal access token is entered in the app form for each run and
-is not stored in `.streamlit/secrets.toml`.
+The request previews hide authorization values. The app does not store the AAVA
+bearer token or GitHub token in Streamlit session state, does not cache agent
+requests, and does not automatically persist generated reports.
 
-The request preview in the UI hides:
+## Verification
 
-- The AAVA bearer token
-- The GitHub personal access token
+Run the unit tests:
 
-## Verifying execution
+```powershell
+python -m unittest discover -s tests -v
+```
 
-After submitting the workflow:
+Run the compile check:
 
-1. Confirm the UI returns a successful HTTP response.
-2. Record the workflow execution ID or job ID.
-3. Open AAVA execution history.
-4. Confirm all workflow agents and tools completed.
-5. Check the target GitHub branch for the generated commit.
+```powershell
+python -m compileall app.py aava_client.py aava_agent_client.py
+```
