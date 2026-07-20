@@ -48,7 +48,8 @@ def extract_agent_output(response_body: dict) -> str:
             if isinstance(agent, dict) and "output" in agent:
                 output = agent["output"]
                 output_path = "data.agentResponse.agent.output"
-        elif "output" in data:
+
+        if output is None and "output" in data:
             output = data["output"]
             output_path = "data.output"
 

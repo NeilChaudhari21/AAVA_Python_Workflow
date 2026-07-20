@@ -6,3 +6,8 @@ __pycache__/
 
 .env
 .DS_Store
+
+data/*.duckdb
+data/*.duckdb.wal
+*.duckdb
+*.duckdb.wal

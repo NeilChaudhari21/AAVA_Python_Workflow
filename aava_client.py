@@ -107,6 +107,33 @@ class WorkflowRequest:
         Both the AAVA bearer token and GitHub personal access token
         are hidden.
         """
+        storage_payload = self.safe_storage_payload()
+        user_inputs = dict(storage_payload["userInputs"])
+        github_config_string = user_inputs[
+            "{{github_config_string_true}}"
+        ]
+        user_inputs[
+            "{{github_config_string_true}}"
+        ] = json.dumps(
+            json.loads(github_config_string),
+            indent=2,
+        )
+        preview_payload = {
+            **storage_payload,
+            "userInputs": user_inputs,
+        }
+
+        return {
+            "method": "POST",
+            "content_type": "multipart/form-data",
+            "form-data": preview_payload,
+            "authorization": "Bearer ********",
+        }
+
+    def safe_storage_payload(self) -> dict[str, object]:
+        """
+        Create the logical workflow request with secrets redacted.
+        """
         user_inputs = self.build_user_inputs()
 
         github_config_string = user_inputs[
@@ -122,23 +149,17 @@ class WorkflowRequest:
         user_inputs[
             "{{github_config_string_true}}"
         ] = json.dumps(
-            github_config,
-            indent=2,
+            github_config
         )
 
         return {
-            "method": "POST",
-            "content_type": "multipart/form-data",
-            "form-data": {
-                "pipelineId": str(
-                    self.pipeline_id
-                ),
-                "userInputs": user_inputs,
-                "priority": str(
-                    self.priority
-                ),
-            },
-            "authorization": "Bearer ********",
+            "pipelineId": str(
+                self.pipeline_id
+            ),
+            "userInputs": user_inputs,
+            "priority": str(
+                self.priority
+            ),
         }
 
 

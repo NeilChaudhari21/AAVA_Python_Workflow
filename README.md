@@ -1,13 +1,15 @@
 # AAVA Python Migration UI
 
-A Streamlit interface for running the complete AAVA Python migration workflow
-or running documentation-focused AAVA agents independently.
+A Streamlit interface for running the complete AAVA Python migration workflow,
+running documentation-focused AAVA agents independently, and reviewing local
+execution history.
 
-The app has three top-level tabs:
+The app has four top-level tabs:
 
 - **Full Workflow** runs the existing end-to-end migration workflow.
 - **Repository Analyzer** runs only the Repository Analyzer Agent.
 - **Python Migration** runs only the Python Migration Agent.
+- **Execution History** shows locally stored DuckDB execution records.
 
 ## Request formats
 
@@ -24,9 +26,10 @@ It also sends the AAVA API token using the Authorization header:
 Authorization: Bearer <AAVA_TOKEN>
 ```
 
-The full workflow still asks the user to enter a GitHub personal access token
-in the UI for each run. That token is inserted into the existing nested
-`github_config` workflow input and is never displayed in request previews.
+The full workflow asks the user to enter a GitHub personal access token in the
+UI for each run. That token is inserted into the existing nested
+`github_config` workflow input and is never displayed in request previews or
+stored in execution history.
 
 The **Repository Analyzer** and **Python Migration** tabs use the standalone
 AAVA agent endpoint. These requests are JSON POST requests to
@@ -35,7 +38,7 @@ minutes to return the completed response. The app waits for the HTTP response
 and does not poll.
 
 Standalone agent reports are extracted from the final Markdown `output` field.
-The app supports both observed AAVA response shapes:
+The app supports these observed AAVA response shapes:
 
 ```text
 data.agentResponse.output
@@ -44,9 +47,40 @@ data.output
 output
 ```
 
-The extracted value is rendered as Markdown and can be downloaded as a `.md`
-file. Agent outputs are kept only in Streamlit session state and are not
-automatically written to disk.
+## Local execution history
+
+DuckDB is embedded directly in the Python app. No DuckDB account, external
+server, MotherDuck, PostgreSQL, Supabase, or other service is required.
+
+By default, execution records are stored in:
+
+```text
+data/aava_executions.duckdb
+```
+
+`DUCKDB_PATH` is optional. If it is missing or blank, the default path above is
+used and the parent directory is created automatically.
+
+Every attempted AAVA API call is recorded after validation passes:
+
+- Full workflow submissions
+- Repository Analyzer agent executions
+- Python Migration agent executions
+
+Each record stores execution metadata, sanitized request JSON, sanitized
+response JSON, and extracted agent Markdown output when available. Credentials
+are redacted before storage, including Authorization values, AAVA bearer
+tokens, GitHub tokens, access tokens, and nested workflow `github_config`
+tokens.
+
+The Execution History tab can inspect stored records, view sanitized request
+and response JSON, render stored Markdown output, and download those stored
+artifacts.
+
+Local DuckDB files persist during normal local development. Streamlit Community
+Cloud does not guarantee persistence of local files across app restarts or
+redeployments. A persistent company deployment will eventually need an
+approved persistent volume or external storage location.
 
 ## Project structure
 
@@ -55,6 +89,7 @@ aava-workflow-ui/
 |-- app.py
 |-- aava_client.py
 |-- aava_agent_client.py
+|-- execution_store.py
 |-- requirements.txt
 |-- README.md
 |-- .gitignore
@@ -62,7 +97,9 @@ aava-workflow-ui/
 |   |-- secrets.toml
 |   `-- secrets.toml.example
 `-- tests/
-    `-- test_aava_agent_client.py
+    |-- test_aava_agent_client.py
+    |-- test_aava_client.py
+    `-- test_execution_store.py
 ```
 
 ## Setup
@@ -88,7 +125,7 @@ py -m venv .venv
 ### 4. Install dependencies
 
 ```powershell
-pip install -r requirements.txt
+python -m pip install -r requirements.txt
 ```
 
 ### 5. Configure secrets
@@ -110,6 +147,9 @@ AAVA_BEARER_TOKEN = "YOUR_AAVA_TOKEN"
 AAVA_USER_EMAIL = "your.name@ascendion.com"
 AAVA_REPO_ANALYZER_AGENT_ID = "45881"
 AAVA_PYTHON_MIGRATION_AGENT_ID = "45878"
+
+# Optional
+DUCKDB_PATH = "data/aava_executions.duckdb"
 ```
 
 Do not put a GitHub token in `.streamlit/secrets.toml`. The Full Workflow tab
@@ -118,7 +158,7 @@ asks each user to enter their own GitHub token for each workflow run.
 ## Run the application
 
 ```powershell
-streamlit run app.py
+python -m streamlit run app.py
 ```
 
 Streamlit should open the application in a browser. The default local address
@@ -169,7 +209,8 @@ The Repository Analyzer tab runs agent ID `45881` independently. It collects:
 - Target Python version
 
 The standalone agent does not require a GitHub token. The report is displayed
-as rendered Markdown and can be downloaded as `repository-analysis.md`.
+as rendered Markdown, saved in session state, stored in DuckDB history, and can
+be downloaded as `repository-analysis.md`.
 
 ## Python Migration tab
 
@@ -184,8 +225,8 @@ The analyzer report can come from:
 
 The standalone Python Migration Agent does not require a GitHub token,
 repository URL, branch, target branch, or commit message. The report is
-displayed as rendered Markdown and can be downloaded as
-`python-migration-report.md`.
+displayed as rendered Markdown, saved in session state, stored in DuckDB
+history, and can be downloaded as `python-migration-report.md`.
 
 ## Security
 
@@ -193,15 +234,26 @@ Never commit:
 
 ```text
 .streamlit/secrets.toml
+data/*.duckdb
+data/*.duckdb.wal
+*.duckdb
+*.duckdb.wal
 ```
 
-The `.gitignore` file excludes it automatically.
+The `.gitignore` file excludes these automatically.
 
-The request previews hide authorization values. The app does not store the AAVA
-bearer token or GitHub token in Streamlit session state, does not cache agent
-requests, and does not automatically persist generated reports.
+The request previews hide authorization values. The app does not store the
+AAVA bearer token or GitHub token in Streamlit session state, does not cache
+agent requests, and redacts credentials before writing request or response JSON
+to DuckDB.
 
 ## Verification
+
+Install dependencies:
+
+```powershell
+python -m pip install -r requirements.txt
+```
 
 Run the unit tests:
 
@@ -212,5 +264,11 @@ python -m unittest discover -s tests -v
 Run the compile check:
 
 ```powershell
-python -m compileall app.py aava_client.py aava_agent_client.py
+python -m compileall app.py aava_client.py aava_agent_client.py execution_store.py
+```
+
+Run the app locally:
+
+```powershell
+python -m streamlit run app.py
 ```

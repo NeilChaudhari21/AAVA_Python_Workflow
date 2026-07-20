@@ -1,3 +1,4 @@
+import json
 import re
 import time
 from urllib.parse import urlparse
@@ -11,9 +12,11 @@ from aava_agent_client import (
     extract_agent_output,
 )
 from aava_client import AavaWorkflowClient, WorkflowRequest
+from execution_store import ExecutionRecord, ExecutionStore
 
 
 DEFAULT_REPO_URL = "https://github.com/NeilChaudhari21/python_demo"
+DEFAULT_DUCKDB_PATH = "data/aava_executions.duckdb"
 
 
 st.set_page_config(
@@ -66,6 +69,27 @@ def required_secret(name: str) -> str:
         st.stop()
 
     return value
+
+
+def optional_secret(
+    name: str,
+    default_value: str,
+) -> str:
+    """
+    Read an optional Streamlit secret with a default fallback.
+    """
+    try:
+        value = str(st.secrets[name]).strip()
+    except KeyError:
+        return default_value
+
+    return value or default_value
+
+
+@st.cache_resource
+def get_execution_store(database_path: str) -> ExecutionStore:
+    """Create the local DuckDB execution store."""
+    return ExecutionStore(database_path)
 
 
 def is_valid_http_url(value: str) -> bool:
@@ -134,6 +158,46 @@ def display_validation_errors(validation_errors: list[str]) -> bool:
     return True
 
 
+def persist_execution_safely(
+    record: ExecutionRecord,
+    secret_values: tuple[str, ...],
+) -> str | None:
+    """
+    Save execution history without hiding completed AAVA results.
+    """
+    try:
+        return execution_store.save_execution(
+            record,
+            secret_values=secret_values,
+        )
+    except Exception as error:
+        st.warning(
+            "The execution attempt could not be saved to "
+            f"DuckDB history: {error}"
+        )
+        return None
+
+
+def concise_text(value: str, max_length: int = 800) -> str:
+    """Trim long server messages for display and storage."""
+    text = value.strip()
+    if len(text) > max_length:
+        return text[:max_length] + "..."
+
+    return text
+
+
+def format_created_at(value: object) -> str:
+    """Format stored timestamps for display."""
+    if value is None:
+        return "Not recorded"
+
+    try:
+        return value.strftime("%Y-%m-%d %H:%M UTC")
+    except AttributeError:
+        return str(value)
+
+
 def parse_json_response(response: requests.Response) -> dict:
     """Parse an AAVA response as JSON with a UI-safe error message."""
     try:
@@ -173,43 +237,170 @@ def require_successful_agent_response(
 def run_agent_request(
     request: AgentExecutionRequest,
     spinner_message: str,
+    *,
+    execution_name: str,
+    target_id: str,
+    repo_url: str | None = None,
+    branch: str | None = None,
+    target_python_version: str | None = None,
+    target_branch: str | None = None,
 ) -> tuple[str, float, dict]:
     """Execute an agent request and return its Markdown output."""
     started_at = time.perf_counter()
+    request_json = request.to_payload()
+
+    def save_agent_record(
+        *,
+        outcome: str,
+        response_json: dict,
+        elapsed_seconds: float | None,
+        http_status: int | None,
+        aava_status: str | None,
+        output_markdown: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        persist_execution_safely(
+            ExecutionRecord(
+                execution_type="agent",
+                execution_name=execution_name,
+                target_id=target_id,
+                repo_url=repo_url,
+                branch=branch,
+                target_python_version=target_python_version,
+                target_branch=target_branch,
+                outcome=outcome,
+                aava_status=aava_status,
+                http_status=http_status,
+                elapsed_seconds=elapsed_seconds,
+                request_json=request_json,
+                response_json=response_json,
+                aava_execution_id=request.execution_id,
+                job_id=None,
+                output_markdown=output_markdown,
+                error_message=error_message,
+            ),
+            secret_values=(bearer_token,),
+        )
 
     with st.spinner(spinner_message):
         try:
             response = agent_client.execute(request)
         except requests.Timeout:
-            st.error(
+            error_message = (
                 "The AAVA agent request timed out before the completed "
                 "response was returned."
             )
+            save_agent_record(
+                outcome="TIMEOUT",
+                response_json={},
+                elapsed_seconds=time.perf_counter() - started_at,
+                http_status=None,
+                aava_status=None,
+                error_message=error_message,
+            )
+            st.error(
+                error_message
+            )
             st.stop()
         except requests.RequestException as error:
-            st.error(f"Could not connect to AAVA agent endpoint: {error}")
+            error_message = (
+                f"Could not connect to AAVA agent endpoint: {error}"
+            )
+            save_agent_record(
+                outcome="REQUEST_ERROR",
+                response_json={},
+                elapsed_seconds=time.perf_counter() - started_at,
+                http_status=None,
+                aava_status=None,
+                error_message=error_message,
+            )
+            st.error(error_message)
             st.stop()
 
     elapsed_seconds = time.perf_counter() - started_at
 
+    try:
+        response_body = response.json()
+        if not isinstance(response_body, dict):
+            response_body = {
+                "raw_response": response.text,
+            }
+    except ValueError:
+        response_body = {
+            "raw_response": response.text,
+        }
+
+    aava_status = response_body.get("status")
+
     if not response.ok:
-        server_message = response.text.strip()
-        if len(server_message) > 800:
-            server_message = server_message[:800] + "..."
+        server_message = concise_text(response.text)
+        save_agent_record(
+            outcome="HTTP_ERROR",
+            response_json=response_body,
+            elapsed_seconds=elapsed_seconds,
+            http_status=response.status_code,
+            aava_status=aava_status,
+            error_message=server_message or (
+                f"AAVA returned HTTP {response.status_code}."
+            ),
+        )
 
         st.error(f"AAVA returned HTTP {response.status_code}.")
         if server_message:
             st.code(server_message)
         st.stop()
 
-    response_body = parse_json_response(response)
-    require_successful_agent_response(response, response_body)
+    if "raw_response" in response_body:
+        error_message = "AAVA returned a non-JSON response."
+        save_agent_record(
+            outcome="INVALID_RESPONSE",
+            response_json=response_body,
+            elapsed_seconds=elapsed_seconds,
+            http_status=response.status_code,
+            aava_status=None,
+            error_message=error_message,
+        )
+        st.error(error_message)
+        st.stop()
+
+    if aava_status is not None and aava_status != "SUCCESS":
+        error_message = (
+            f"AAVA agent execution returned status `{aava_status}`."
+        )
+        save_agent_record(
+            outcome="AAVA_ERROR",
+            response_json=response_body,
+            elapsed_seconds=elapsed_seconds,
+            http_status=response.status_code,
+            aava_status=aava_status,
+            error_message=error_message,
+        )
+        st.error(error_message)
+        st.stop()
 
     try:
         output = extract_agent_output(response_body)
     except ValueError as error:
+        error_message = str(error)
+        save_agent_record(
+            outcome="INVALID_RESPONSE",
+            response_json=response_body,
+            elapsed_seconds=elapsed_seconds,
+            http_status=response.status_code,
+            aava_status=aava_status,
+            error_message=error_message,
+        )
         st.error(str(error))
         st.stop()
+
+    save_agent_record(
+        outcome="SUCCESS",
+        response_json=response_body,
+        elapsed_seconds=elapsed_seconds,
+        http_status=response.status_code,
+        aava_status=aava_status or "SUCCESS",
+        output_markdown=output,
+    )
 
     return output, elapsed_seconds, response_body
 
@@ -372,6 +563,45 @@ def run_full_workflow_tab() -> None:
         target_branch=target_branch,
         commit_message=commit_message,
     )
+    storage_request_json = workflow_request.safe_storage_payload()
+
+    def save_workflow_record(
+        *,
+        outcome: str,
+        response_json: dict,
+        elapsed_seconds: float | None,
+        http_status: int | None,
+        aava_status: str | None,
+        aava_execution_id: str | None = None,
+        job_id: str | None = None,
+        output_markdown: str | None = None,
+        error_message: str | None = None,
+    ) -> None:
+        persist_execution_safely(
+            ExecutionRecord(
+                execution_type="workflow",
+                execution_name="Python Migration Workflow",
+                target_id=pipeline_id,
+                repo_url=repo_url,
+                branch=branch,
+                target_python_version=target_python_version,
+                target_branch=target_branch,
+                outcome=outcome,
+                aava_status=aava_status,
+                http_status=http_status,
+                elapsed_seconds=elapsed_seconds,
+                request_json=storage_request_json,
+                response_json=response_json,
+                aava_execution_id=aava_execution_id,
+                job_id=job_id,
+                output_markdown=output_markdown,
+                error_message=error_message,
+            ),
+            secret_values=(
+                github_token,
+                bearer_token,
+            ),
+        )
 
     # Display the outgoing request without exposing either token.
     if show_preview:
@@ -384,6 +614,7 @@ def run_full_workflow_tab() -> None:
             )
 
     # Send the workflow request to AAVA.
+    started_at = time.perf_counter()
     with st.spinner(
         "Submitting the workflow to AAVA..."
     ):
@@ -391,45 +622,109 @@ def run_full_workflow_tab() -> None:
             response = workflow_client.execute(
                 workflow_request
             )
-        except Exception as error:
+        except requests.Timeout:
+            elapsed_seconds = time.perf_counter() - started_at
+            error_message = (
+                "The AAVA workflow request timed out before a response "
+                "was returned."
+            )
+            save_workflow_record(
+                outcome="TIMEOUT",
+                response_json={},
+                elapsed_seconds=elapsed_seconds,
+                http_status=None,
+                aava_status=None,
+                error_message=error_message,
+            )
+            st.error(error_message)
+            st.stop()
+        except requests.RequestException as error:
+            elapsed_seconds = time.perf_counter() - started_at
+            error_message = f"Could not submit the workflow: {error}"
+            save_workflow_record(
+                outcome="REQUEST_ERROR",
+                response_json={},
+                elapsed_seconds=elapsed_seconds,
+                http_status=None,
+                aava_status=None,
+                error_message=error_message,
+            )
             st.error(
-                f"Could not submit the workflow: {error}"
+                error_message
             )
             st.stop()
+
+    elapsed_seconds = time.perf_counter() - started_at
 
     # Attempt to parse the AAVA response as JSON.
     try:
         response_body = response.json()
+        response_is_json = isinstance(response_body, dict)
+        if not response_is_json:
+            response_body = {
+                "raw_response": response.text
+            }
     except ValueError:
+        response_is_json = False
         response_body = {
             "raw_response": response.text
         }
 
-    if response.ok:
-        st.success(
-            "Workflow submitted successfully."
+    response_data = {}
+    api_status = None
+    workflow_execution_id = None
+    job_id = None
+
+    if isinstance(response_body, dict):
+        data_value = response_body.get(
+            "data",
+            {},
         )
+        if isinstance(data_value, dict):
+            response_data = data_value
 
-        if isinstance(response_body, dict):
-            response_data = response_body.get(
-                "data",
-                {},
-            )
-
-            api_status = response_body.get(
-                "status",
-                "SUCCESS",
-            )
-        else:
-            response_data = {}
-            api_status = "SUCCESS"
-
+        api_status = response_body.get(
+            "status",
+            "SUCCESS" if response.ok else None,
+        )
         workflow_execution_id = response_data.get(
             "workflowExecutionId"
         )
-
         job_id = response_data.get(
             "jobId"
+        )
+
+    if not response.ok:
+        workflow_outcome = "HTTP_ERROR"
+        workflow_error_message = concise_text(response.text) or (
+            f"AAVA returned HTTP {response.status_code}."
+        )
+    elif not response_is_json:
+        workflow_outcome = "INVALID_RESPONSE"
+        workflow_error_message = "AAVA returned a non-JSON response."
+    elif api_status is not None and api_status != "SUCCESS":
+        workflow_outcome = "AAVA_ERROR"
+        workflow_error_message = (
+            f"AAVA workflow returned status `{api_status}`."
+        )
+    else:
+        workflow_outcome = "SUCCESS"
+        workflow_error_message = None
+
+    save_workflow_record(
+        outcome=workflow_outcome,
+        response_json=response_body,
+        elapsed_seconds=elapsed_seconds,
+        http_status=response.status_code,
+        aava_status=api_status,
+        aava_execution_id=workflow_execution_id,
+        job_id=str(job_id) if job_id is not None else None,
+        error_message=workflow_error_message,
+    )
+
+    if response.ok:
+        st.success(
+            "Workflow submitted successfully."
         )
 
         status_column, api_column, job_column = st.columns(3)
@@ -573,6 +868,11 @@ def run_repository_analyzer_tab() -> None:
             agent_request,
             "Running Repository Analyzer Agent. "
             "This may take a few minutes...",
+            execution_name="Repository Analyzer Agent",
+            target_id=repo_analyzer_agent_id,
+            repo_url=repo_url,
+            branch=branch,
+            target_python_version=target_python_version,
         )
 
         st.session_state["repo_analyzer_output"] = output
@@ -750,6 +1050,19 @@ def run_python_migration_tab() -> None:
             agent_request,
             "Running Python Migration Agent. "
             "This may take a few minutes...",
+            execution_name="Python Migration Agent",
+            target_id=python_migration_agent_id,
+            repo_url=(
+                st.session_state["repo_analyzer_repo_url"]
+                if analyzer_source == "Use latest Repository Analyzer result"
+                else None
+            ),
+            branch=(
+                st.session_state["repo_analyzer_branch"]
+                if analyzer_source == "Use latest Repository Analyzer result"
+                else None
+            ),
+            target_python_version=target_python_version,
         )
 
         st.session_state["python_migration_output"] = output
@@ -779,6 +1092,209 @@ def run_python_migration_tab() -> None:
         )
 
 
+def make_history_label(record: dict[str, object]) -> str:
+    """Create a readable selectbox label for a history record."""
+    created_at = format_created_at(record.get("created_at"))
+    name = record.get("execution_name") or "Execution"
+    outcome = record.get("outcome") or "UNKNOWN"
+    repo_url = record.get("repo_url") or "No repository"
+
+    return f"{created_at} | {name} | {outcome} | {repo_url}"
+
+
+def run_execution_history_tab() -> None:
+    """Render locally stored DuckDB execution history."""
+    st.subheader("Execution History")
+
+    st.caption(
+        "Full workflow and standalone-agent requests are stored locally "
+        "in DuckDB. Credentials are redacted before storage."
+    )
+    st.caption(
+        "Local files on Streamlit Community Cloud are not guaranteed to "
+        "persist across app restarts or redeployments."
+    )
+
+    try:
+        records = execution_store.list_executions(limit=100)
+    except Exception as error:
+        st.error(f"Could not load execution history: {error}")
+        return
+
+    if not records:
+        st.info("No stored executions yet.")
+        return
+
+    filter_columns = st.columns(2)
+    execution_type_filter = filter_columns[0].selectbox(
+        "Execution type",
+        [
+            "All",
+            "workflow",
+            "agent",
+        ],
+    )
+    outcome_filter = filter_columns[1].selectbox(
+        "Outcome",
+        [
+            "All",
+            "SUCCESS",
+            "HTTP_ERROR",
+            "AAVA_ERROR",
+            "INVALID_RESPONSE",
+            "TIMEOUT",
+            "REQUEST_ERROR",
+        ],
+    )
+
+    filtered_records = records
+    if execution_type_filter != "All":
+        filtered_records = [
+            record
+            for record in filtered_records
+            if record.get("execution_type") == execution_type_filter
+        ]
+
+    if outcome_filter != "All":
+        filtered_records = [
+            record
+            for record in filtered_records
+            if record.get("outcome") == outcome_filter
+        ]
+
+    if not filtered_records:
+        st.info("No stored executions match the selected filters.")
+        return
+
+    table_rows = [
+        {
+            "Created At": format_created_at(record.get("created_at")),
+            "Type": record.get("execution_type"),
+            "Name": record.get("execution_name"),
+            "Repository": record.get("repo_url"),
+            "Branch": record.get("branch"),
+            "Target Python": record.get("target_python_version"),
+            "Target Branch": record.get("target_branch"),
+            "Outcome": record.get("outcome"),
+            "HTTP": record.get("http_status"),
+            "Elapsed Seconds": record.get("elapsed_seconds"),
+            "AAVA Execution ID": record.get("aava_execution_id"),
+            "Job ID": record.get("job_id"),
+        }
+        for record in filtered_records
+    ]
+
+    st.dataframe(
+        table_rows,
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    record_by_id = {
+        str(record["record_id"]): record
+        for record in filtered_records
+    }
+    selected_record_id = st.selectbox(
+        "Select an execution",
+        list(record_by_id.keys()),
+        format_func=lambda record_id: make_history_label(
+            record_by_id[record_id]
+        ),
+    )
+
+    try:
+        selected_record = execution_store.get_execution(selected_record_id)
+    except Exception as error:
+        st.error(f"Could not load selected execution: {error}")
+        return
+
+    if selected_record is None:
+        st.warning("The selected execution could not be found.")
+        return
+
+    st.write("**Execution metadata**")
+    metadata = {
+        "Record ID": selected_record["record_id"],
+        "Created At": format_created_at(selected_record["created_at"]),
+        "Type": selected_record["execution_type"],
+        "Name": selected_record["execution_name"],
+        "Target ID": selected_record["target_id"],
+        "Repository": selected_record["repo_url"],
+        "Branch": selected_record["branch"],
+        "Target Python": selected_record["target_python_version"],
+        "Target Branch": selected_record["target_branch"],
+        "Outcome": selected_record["outcome"],
+        "AAVA Status": selected_record["aava_status"],
+        "HTTP": selected_record["http_status"],
+        "Elapsed Seconds": selected_record["elapsed_seconds"],
+        "AAVA Execution ID": selected_record["aava_execution_id"],
+        "Job ID": selected_record["job_id"],
+    }
+    st.json(metadata)
+
+    request_json = selected_record["request_json"]
+    response_json = selected_record["response_json"]
+    request_download = json.dumps(
+        request_json,
+        indent=2,
+        ensure_ascii=False,
+        default=str,
+    )
+    response_download = json.dumps(
+        response_json,
+        indent=2,
+        ensure_ascii=False,
+        default=str,
+    )
+
+    download_columns = st.columns(3)
+    short_record_id = str(selected_record_id)[:8]
+    download_columns[0].download_button(
+        "Download Request JSON",
+        data=request_download,
+        file_name=f"execution-{short_record_id}-request.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+    download_columns[1].download_button(
+        "Download Response JSON",
+        data=response_download,
+        file_name=f"execution-{short_record_id}-response.json",
+        mime="application/json",
+        use_container_width=True,
+    )
+
+    output_markdown = selected_record["output_markdown"]
+    if output_markdown:
+        download_columns[2].download_button(
+            "Download Markdown Output",
+            data=output_markdown,
+            file_name=f"execution-{short_record_id}-output.md",
+            mime="text/markdown",
+            use_container_width=True,
+        )
+
+    with st.expander(
+        "Stored Request JSON",
+        expanded=False,
+    ):
+        st.json(request_json)
+
+    with st.expander(
+        "Stored Response JSON",
+        expanded=False,
+    ):
+        st.json(response_json)
+
+    if output_markdown:
+        st.write("**Stored Agent Output**")
+        st.markdown(output_markdown)
+
+    if selected_record["error_message"]:
+        st.write("**Stored Error Message**")
+        st.error(selected_record["error_message"])
+
+
 initialize_session_state()
 
 # Load secure configuration values.
@@ -790,6 +1306,16 @@ bearer_token = required_secret("AAVA_BEARER_TOKEN")
 aava_user_email = required_secret("AAVA_USER_EMAIL")
 repo_analyzer_agent_id = required_secret("AAVA_REPO_ANALYZER_AGENT_ID")
 python_migration_agent_id = required_secret("AAVA_PYTHON_MIGRATION_AGENT_ID")
+duckdb_path = optional_secret("DUCKDB_PATH", DEFAULT_DUCKDB_PATH)
+
+try:
+    execution_store = get_execution_store(duckdb_path)
+except Exception as error:
+    st.error(
+        "Could not initialize local DuckDB execution history: "
+        f"{error}"
+    )
+    st.stop()
 
 
 # Create clients responsible for calling AAVA.
@@ -830,6 +1356,9 @@ with st.sidebar:
     st.write("**Python Migration Agent**")
     st.code(python_migration_agent_id)
 
+    st.write("**Execution history DB**")
+    st.code(duckdb_path)
+
     st.caption(
         "AAVA connection secrets are loaded securely. The full workflow "
         "uses the GitHub token entered in the form; standalone agents do "
@@ -844,11 +1373,17 @@ with st.sidebar:
         st.success("Documentation results cleared.")
 
 
-full_workflow_tab, repository_analyzer_tab, python_migration_tab = st.tabs(
+(
+    full_workflow_tab,
+    repository_analyzer_tab,
+    python_migration_tab,
+    execution_history_tab,
+) = st.tabs(
     [
         "Full Workflow",
         "Repository Analyzer",
         "Python Migration",
+        "Execution History",
     ]
 )
 
@@ -860,3 +1395,6 @@ with repository_analyzer_tab:
 
 with python_migration_tab:
     run_python_migration_tab()
+
+with execution_history_tab:
+    run_execution_history_tab()
