@@ -223,6 +223,10 @@ The analyzer report can come from:
 - Pasted Markdown
 - An uploaded `.md` or `.txt` file
 
+When using the latest Repository Analyzer result, the Python Migration tab
+automatically uses the target Python version from that analyzer run. For pasted
+or uploaded analyzer reports, the user enters the target version manually.
+
 The standalone Python Migration Agent does not require a GitHub token,
 repository URL, branch, target branch, or commit message. The report is
 displayed as rendered Markdown, saved in session state, stored in DuckDB

@@ -985,25 +985,25 @@ def run_python_migration_tab() -> None:
     saved_target_version = st.session_state[
         "repo_analyzer_target_version"
     ]
-    default_target_version = (
-        saved_target_version
-        if (
-            analyzer_source == "Use latest Repository Analyzer result"
-            and saved_target_version
-        )
-        else "3.14"
+    use_latest_analyzer = (
+        analyzer_source == "Use latest Repository Analyzer result"
     )
 
     with st.form(
         "python_migration_form",
         clear_on_submit=False,
     ):
-        target_python_version = st.text_input(
-            "Target Python version",
-            value=default_target_version,
-            help="Examples: 3.12, 3.13, or 3.14",
-            key="python_migration_target_version_input",
-        )
+        if use_latest_analyzer:
+            target_python_version = saved_target_version
+            st.write("**Target Python version**")
+            st.code(target_python_version or "Not recorded")
+        else:
+            target_python_version = st.text_input(
+                "Target Python version",
+                value="3.14",
+                help="Examples: 3.12, 3.13, or 3.14",
+                key="python_migration_target_version_input",
+            )
 
         submitted = st.form_submit_button(
             "Run Python Migration Agent",
@@ -1012,7 +1012,7 @@ def run_python_migration_tab() -> None:
         )
 
     if submitted:
-        if analyzer_source == "Use latest Repository Analyzer result":
+        if use_latest_analyzer:
             analyzer_output = latest_output
         elif analyzer_source == "Paste analyzer output":
             analyzer_output = pasted_output.strip()
