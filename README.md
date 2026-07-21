@@ -220,12 +220,14 @@ complete Repository Analyzer Markdown report and a target Python version.
 The analyzer report can come from:
 
 - The latest Repository Analyzer run in the current Streamlit session
+- A successful Repository Analyzer result stored in DuckDB execution history
 - Pasted Markdown
 - An uploaded `.md` or `.txt` file
 
-When using the latest Repository Analyzer result, the Python Migration tab
-automatically uses the target Python version from that analyzer run. For pasted
-or uploaded analyzer reports, the user enters the target version manually.
+When using the latest or saved Repository Analyzer result, the Python Migration
+tab automatically uses the target Python version from that analyzer run. For
+pasted or uploaded analyzer reports, the user enters the target version
+manually.
 
 The standalone Python Migration Agent does not require a GitHub token,
 repository URL, branch, target branch, or commit message. The report is

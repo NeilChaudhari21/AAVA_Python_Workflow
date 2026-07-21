@@ -923,6 +923,7 @@ def run_python_migration_tab() -> None:
         "Repository Analyzer report source",
         [
             "Use latest Repository Analyzer result",
+            "Use Repository Analyzer result from history",
             "Paste analyzer output",
             "Upload .md or .txt file",
         ],
@@ -930,6 +931,10 @@ def run_python_migration_tab() -> None:
     )
 
     latest_output = st.session_state["repo_analyzer_output"]
+    history_output = ""
+    history_repo_url = None
+    history_branch = None
+    history_target_version = ""
     pasted_output = ""
     uploaded_output = ""
 
@@ -965,6 +970,95 @@ def run_python_migration_tab() -> None:
                 "No Repository Analyzer result is saved in this session."
             )
 
+    elif analyzer_source == "Use Repository Analyzer result from history":
+        try:
+            history_records = execution_store.list_executions(limit=500)
+        except Exception as error:
+            history_records = []
+            st.error(f"Could not load Repository Analyzer history: {error}")
+
+        analyzer_records = [
+            record
+            for record in history_records
+            if (
+                record.get("execution_type") == "agent"
+                and record.get("execution_name")
+                == "Repository Analyzer Agent"
+                and record.get("outcome") == "SUCCESS"
+            )
+        ]
+
+        if analyzer_records:
+            analyzer_record_by_id = {
+                str(record["record_id"]): record
+                for record in analyzer_records
+            }
+            selected_history_id = st.selectbox(
+                "Saved Repository Analyzer result",
+                list(analyzer_record_by_id.keys()),
+                format_func=lambda record_id: make_history_label(
+                    analyzer_record_by_id[record_id]
+                ),
+                key="python_migration_history_analyzer_record",
+            )
+
+            try:
+                selected_history_record = execution_store.get_execution(
+                    selected_history_id
+                )
+            except Exception as error:
+                selected_history_record = None
+                st.error(
+                    "Could not load the selected Repository Analyzer "
+                    f"result: {error}"
+                )
+
+            if selected_history_record is not None:
+                history_output = (
+                    selected_history_record.get("output_markdown")
+                    or ""
+                )
+                history_repo_url = selected_history_record.get("repo_url")
+                history_branch = selected_history_record.get("branch")
+                history_target_version = (
+                    selected_history_record.get("target_python_version")
+                    or ""
+                )
+
+                if history_output:
+                    st.success(
+                        "Saved Repository Analyzer result is available."
+                    )
+                    info_columns = st.columns(4)
+                    info_columns[0].write("**Repository**")
+                    info_columns[0].write(history_repo_url or "Not recorded")
+                    info_columns[1].write("**Branch**")
+                    info_columns[1].write(history_branch or "Not recorded")
+                    info_columns[2].write("**Target**")
+                    info_columns[2].write(
+                        history_target_version or "Not recorded"
+                    )
+                    info_columns[3].metric(
+                        "Characters",
+                        len(history_output),
+                    )
+
+                    with st.expander(
+                        "Saved analyzer output preview",
+                        expanded=False,
+                    ):
+                        st.markdown(history_output)
+                else:
+                    st.warning(
+                        "The selected Repository Analyzer history record "
+                        "does not include Markdown output."
+                    )
+        else:
+            st.warning(
+                "No successful Repository Analyzer results are stored "
+                "in execution history yet."
+            )
+
     elif analyzer_source == "Paste analyzer output":
         pasted_output = st.text_area(
             "Repository Analyzer Markdown",
@@ -988,13 +1082,20 @@ def run_python_migration_tab() -> None:
     use_latest_analyzer = (
         analyzer_source == "Use latest Repository Analyzer result"
     )
+    use_history_analyzer = (
+        analyzer_source == "Use Repository Analyzer result from history"
+    )
 
     with st.form(
         "python_migration_form",
         clear_on_submit=False,
     ):
-        if use_latest_analyzer:
-            target_python_version = saved_target_version
+        if use_latest_analyzer or use_history_analyzer:
+            target_python_version = (
+                saved_target_version
+                if use_latest_analyzer
+                else history_target_version
+            )
             st.write("**Target Python version**")
             st.code(target_python_version or "Not recorded")
         else:
@@ -1014,6 +1115,8 @@ def run_python_migration_tab() -> None:
     if submitted:
         if use_latest_analyzer:
             analyzer_output = latest_output
+        elif use_history_analyzer:
+            analyzer_output = history_output
         elif analyzer_source == "Paste analyzer output":
             analyzer_output = pasted_output.strip()
         else:
@@ -1054,12 +1157,16 @@ def run_python_migration_tab() -> None:
             target_id=python_migration_agent_id,
             repo_url=(
                 st.session_state["repo_analyzer_repo_url"]
-                if analyzer_source == "Use latest Repository Analyzer result"
+                if use_latest_analyzer
+                else history_repo_url
+                if use_history_analyzer
                 else None
             ),
             branch=(
                 st.session_state["repo_analyzer_branch"]
-                if analyzer_source == "Use latest Repository Analyzer result"
+                if use_latest_analyzer
+                else history_branch
+                if use_history_analyzer
                 else None
             ),
             target_python_version=target_python_version,
