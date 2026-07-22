@@ -75,7 +75,15 @@ tokens.
 
 The Execution History tab can inspect stored records, view sanitized request
 and response JSON, render stored Markdown output, and download those stored
-artifacts.
+artifacts. It can also rerun stored records. Standalone agent records can be
+rerun directly from their stored request JSON. Full workflow records require a
+fresh GitHub personal access token because the original token is never stored.
+
+The history tab can compare any two stored executions. Repository Analyzer and
+Python Migration comparisons include a Markdown diff when both records have
+stored Markdown output. Full Workflow comparisons show metadata plus sanitized
+request and response JSON, because the workflow endpoint usually returns
+submission metadata rather than final Markdown.
 
 Local DuckDB files persist during normal local development. Streamlit Community
 Cloud does not guarantee persistence of local files across app restarts or

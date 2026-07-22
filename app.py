@@ -1,3 +1,4 @@
+import difflib
 import json
 import re
 import time
@@ -1209,6 +1210,510 @@ def make_history_label(record: dict[str, object]) -> str:
     return f"{created_at} | {name} | {outcome} | {repo_url}"
 
 
+def workflow_request_from_history(
+    record: dict[str, object],
+    github_token: str,
+) -> WorkflowRequest:
+    """Rebuild a full workflow request from sanitized history data."""
+    request_json = record.get("request_json") or {}
+    user_inputs = request_json.get("userInputs") or {}
+    github_config = {}
+    github_config_string = user_inputs.get(
+        "{{github_config_string_true}}",
+        "{}",
+    )
+
+    if isinstance(github_config_string, str):
+        try:
+            parsed_config = json.loads(github_config_string)
+        except ValueError:
+            parsed_config = {}
+
+        if isinstance(parsed_config, dict):
+            github_config = parsed_config
+
+    return WorkflowRequest(
+        pipeline_id=str(request_json.get("pipelineId") or pipeline_id),
+        priority=str(request_json.get("priority") or priority),
+        repo_url=str(
+            user_inputs.get("{{repo_url_string_true}}")
+            or record.get("repo_url")
+            or ""
+        ),
+        branch=str(
+            user_inputs.get("{{branch_string_true}}")
+            or record.get("branch")
+            or ""
+        ),
+        target_python_version=str(
+            user_inputs.get("{{target_python_version_string_true}}")
+            or record.get("target_python_version")
+            or ""
+        ),
+        github_token=github_token,
+        target_branch=str(
+            github_config.get("target_branch")
+            or record.get("target_branch")
+            or ""
+        ),
+        commit_message=str(
+            github_config.get("commit_message")
+            or "Apply Python migration updates from UI"
+        ),
+    )
+
+
+def rerun_workflow_from_history(
+    record: dict[str, object],
+    github_token: str,
+) -> None:
+    """Run a stored full workflow request with a fresh GitHub token."""
+    workflow_request = workflow_request_from_history(
+        record,
+        github_token,
+    )
+    validation_errors: list[str] = []
+
+    if not is_valid_http_url(workflow_request.repo_url):
+        validation_errors.append(
+            "Stored workflow record does not contain a valid repository URL."
+        )
+
+    if not workflow_request.branch:
+        validation_errors.append(
+            "Stored workflow record does not contain a source branch."
+        )
+
+    if not is_valid_python_version(workflow_request.target_python_version):
+        validation_errors.append(
+            "Stored workflow record does not contain a valid target "
+            "Python version."
+        )
+
+    if not workflow_request.target_branch:
+        validation_errors.append(
+            "Stored workflow record does not contain a target branch."
+        )
+
+    if not workflow_request.commit_message:
+        validation_errors.append(
+            "Stored workflow record does not contain a commit message."
+        )
+
+    if not github_token:
+        validation_errors.append(
+            "GitHub personal access token is required to rerun a full "
+            "workflow."
+        )
+
+    if display_validation_errors(validation_errors):
+        st.stop()
+
+    storage_request_json = workflow_request.safe_storage_payload()
+    started_at = time.perf_counter()
+
+    with st.spinner("Rerunning the full workflow from history..."):
+        try:
+            response = workflow_client.execute(workflow_request)
+        except requests.Timeout:
+            elapsed_seconds = time.perf_counter() - started_at
+            error_message = (
+                "The AAVA workflow request timed out before a response "
+                "was returned."
+            )
+            persist_execution_safely(
+                ExecutionRecord(
+                    execution_type="workflow",
+                    execution_name="Python Migration Workflow",
+                    target_id=workflow_request.pipeline_id,
+                    repo_url=workflow_request.repo_url,
+                    branch=workflow_request.branch,
+                    target_python_version=(
+                        workflow_request.target_python_version
+                    ),
+                    target_branch=workflow_request.target_branch,
+                    outcome="TIMEOUT",
+                    aava_status=None,
+                    http_status=None,
+                    elapsed_seconds=elapsed_seconds,
+                    request_json=storage_request_json,
+                    response_json={},
+                    aava_execution_id=None,
+                    job_id=None,
+                    output_markdown=None,
+                    error_message=error_message,
+                ),
+                secret_values=(
+                    github_token,
+                    bearer_token,
+                ),
+            )
+            st.error(error_message)
+            st.stop()
+        except requests.RequestException as error:
+            elapsed_seconds = time.perf_counter() - started_at
+            error_message = f"Could not submit the workflow: {error}"
+            persist_execution_safely(
+                ExecutionRecord(
+                    execution_type="workflow",
+                    execution_name="Python Migration Workflow",
+                    target_id=workflow_request.pipeline_id,
+                    repo_url=workflow_request.repo_url,
+                    branch=workflow_request.branch,
+                    target_python_version=(
+                        workflow_request.target_python_version
+                    ),
+                    target_branch=workflow_request.target_branch,
+                    outcome="REQUEST_ERROR",
+                    aava_status=None,
+                    http_status=None,
+                    elapsed_seconds=elapsed_seconds,
+                    request_json=storage_request_json,
+                    response_json={},
+                    aava_execution_id=None,
+                    job_id=None,
+                    output_markdown=None,
+                    error_message=error_message,
+                ),
+                secret_values=(
+                    github_token,
+                    bearer_token,
+                ),
+            )
+            st.error(error_message)
+            st.stop()
+
+    elapsed_seconds = time.perf_counter() - started_at
+
+    try:
+        response_body = response.json()
+        response_is_json = isinstance(response_body, dict)
+        if not response_is_json:
+            response_body = {
+                "raw_response": response.text,
+            }
+    except ValueError:
+        response_is_json = False
+        response_body = {
+            "raw_response": response.text,
+        }
+
+    response_data = response_body.get("data", {})
+    if not isinstance(response_data, dict):
+        response_data = {}
+
+    api_status = response_body.get(
+        "status",
+        "SUCCESS" if response.ok else None,
+    )
+    workflow_execution_id = response_data.get("workflowExecutionId")
+    job_id = response_data.get("jobId")
+
+    if not response.ok:
+        outcome = "HTTP_ERROR"
+        error_message = concise_text(response.text) or (
+            f"AAVA returned HTTP {response.status_code}."
+        )
+    elif not response_is_json:
+        outcome = "INVALID_RESPONSE"
+        error_message = "AAVA returned a non-JSON response."
+    elif api_status is not None and api_status != "SUCCESS":
+        outcome = "AAVA_ERROR"
+        error_message = f"AAVA workflow returned status `{api_status}`."
+    else:
+        outcome = "SUCCESS"
+        error_message = None
+
+    persist_execution_safely(
+        ExecutionRecord(
+            execution_type="workflow",
+            execution_name="Python Migration Workflow",
+            target_id=workflow_request.pipeline_id,
+            repo_url=workflow_request.repo_url,
+            branch=workflow_request.branch,
+            target_python_version=workflow_request.target_python_version,
+            target_branch=workflow_request.target_branch,
+            outcome=outcome,
+            aava_status=api_status,
+            http_status=response.status_code,
+            elapsed_seconds=elapsed_seconds,
+            request_json=storage_request_json,
+            response_json=response_body,
+            aava_execution_id=(
+                str(workflow_execution_id)
+                if workflow_execution_id is not None
+                else None
+            ),
+            job_id=str(job_id) if job_id is not None else None,
+            output_markdown=None,
+            error_message=error_message,
+        ),
+        secret_values=(
+            github_token,
+            bearer_token,
+        ),
+    )
+
+    if response.ok:
+        st.success("Workflow rerun submitted successfully.")
+    else:
+        st.error(f"AAVA returned HTTP {response.status_code}.")
+
+    status_column, api_column, job_column = st.columns(3)
+    status_column.metric("HTTP", response.status_code)
+    api_column.metric("API status", str(api_status or "Not returned"))
+    job_column.metric("Job ID", str(job_id or "Not returned"))
+
+    if workflow_execution_id:
+        st.write("**Workflow execution ID**")
+        st.code(str(workflow_execution_id))
+
+    with st.expander(
+        "Rerun AAVA response",
+        expanded=response.ok,
+    ):
+        st.json(response_body)
+
+    if error_message:
+        st.error(error_message)
+
+
+def rerun_agent_from_history(record: dict[str, object]) -> None:
+    """Rerun a stored standalone agent request."""
+    request_json = record.get("request_json") or {}
+    user_inputs = request_json.get("userInputs") or {}
+    target_id = str(record.get("target_id") or request_json.get("agentId"))
+    execution_name = str(record.get("execution_name") or "Agent")
+
+    if not isinstance(user_inputs, dict):
+        st.error("Stored agent record does not contain valid user inputs.")
+        st.stop()
+
+    if not target_id:
+        st.error("Stored agent record does not contain an agent ID.")
+        st.stop()
+
+    agent_request = AgentExecutionRequest(
+        agent_id=target_id,
+        user=str(request_json.get("user") or aava_user_email),
+        user_inputs={
+            str(key): str(value)
+            for key, value in user_inputs.items()
+        },
+    )
+
+    output, elapsed_seconds, _response_body = run_agent_request(
+        agent_request,
+        f"Rerunning {execution_name}. This may take a few minutes...",
+        execution_name=execution_name,
+        target_id=target_id,
+        repo_url=(
+            str(record.get("repo_url"))
+            if record.get("repo_url") is not None
+            else None
+        ),
+        branch=(
+            str(record.get("branch"))
+            if record.get("branch") is not None
+            else None
+        ),
+        target_python_version=(
+            str(record.get("target_python_version"))
+            if record.get("target_python_version") is not None
+            else None
+        ),
+        target_branch=(
+            str(record.get("target_branch"))
+            if record.get("target_branch") is not None
+            else None
+        ),
+    )
+
+    if execution_name == "Repository Analyzer Agent":
+        st.session_state["repo_analyzer_output"] = output
+        st.session_state["repo_analyzer_elapsed_seconds"] = elapsed_seconds
+        st.session_state["repo_analyzer_execution_id"] = (
+            agent_request.execution_id
+        )
+        st.session_state["repo_analyzer_repo_url"] = (
+            record.get("repo_url") or ""
+        )
+        st.session_state["repo_analyzer_branch"] = record.get("branch") or ""
+        st.session_state["repo_analyzer_target_version"] = (
+            record.get("target_python_version") or ""
+        )
+    elif execution_name == "Python Migration Agent":
+        st.session_state["python_migration_output"] = output
+        st.session_state["python_migration_elapsed_seconds"] = elapsed_seconds
+        st.session_state["python_migration_execution_id"] = (
+            agent_request.execution_id
+        )
+        st.session_state["python_migration_target_version"] = (
+            record.get("target_python_version") or ""
+        )
+
+    render_report_result(
+        success_message=f"{execution_name} rerun completed.",
+        elapsed_seconds=elapsed_seconds,
+        execution_id=agent_request.execution_id,
+        output=output,
+        download_label=f"Download {execution_name} Rerun Output",
+        download_file_name=(
+            f"{execution_name.lower().replace(' ', '-')}-rerun.md"
+        ),
+    )
+
+
+def render_rerun_controls(record: dict[str, object]) -> None:
+    """Render rerun controls for a selected history record."""
+    st.write("**Rerun**")
+
+    if record["execution_type"] == "agent":
+        if st.button(
+            f"Rerun {record['execution_name']}",
+            type="primary",
+            use_container_width=True,
+        ):
+            rerun_agent_from_history(record)
+
+        return
+
+    if record["execution_type"] == "workflow":
+        st.caption(
+            "Full workflow history does not store the GitHub token, so "
+            "enter a fresh token before rerunning."
+        )
+        github_token = st.text_input(
+            "GitHub personal access token for rerun",
+            type="password",
+            key=f"rerun_github_token_{record['record_id']}",
+        )
+
+        if st.button(
+            "Rerun Full Workflow",
+            type="primary",
+            use_container_width=True,
+        ):
+            rerun_workflow_from_history(
+                record,
+                github_token.strip(),
+            )
+
+
+def render_record_comparison(records: list[dict[str, object]]) -> None:
+    """Render controls for comparing two stored execution records."""
+    st.subheader("Compare Executions")
+
+    if len(records) < 2:
+        st.info("At least two stored executions are needed for comparison.")
+        return
+
+    record_by_id = {
+        str(record["record_id"]): record
+        for record in records
+    }
+    record_ids = list(record_by_id.keys())
+    compare_columns = st.columns(2)
+    first_id = compare_columns[0].selectbox(
+        "First execution",
+        record_ids,
+        format_func=lambda record_id: make_history_label(
+            record_by_id[record_id]
+        ),
+        key="compare_first_execution",
+    )
+    second_default_index = 1 if len(record_ids) > 1 else 0
+    second_id = compare_columns[1].selectbox(
+        "Second execution",
+        record_ids,
+        index=second_default_index,
+        format_func=lambda record_id: make_history_label(
+            record_by_id[record_id]
+        ),
+        key="compare_second_execution",
+    )
+
+    if first_id == second_id:
+        st.warning("Choose two different executions to compare.")
+        return
+
+    try:
+        first_record = execution_store.get_execution(first_id)
+        second_record = execution_store.get_execution(second_id)
+    except Exception as error:
+        st.error(f"Could not load comparison records: {error}")
+        return
+
+    if first_record is None or second_record is None:
+        st.warning("One of the selected executions could not be found.")
+        return
+
+    first_meta = {
+        "Name": first_record["execution_name"],
+        "Outcome": first_record["outcome"],
+        "Repository": first_record["repo_url"],
+        "Branch": first_record["branch"],
+        "Target Python": first_record["target_python_version"],
+        "HTTP": first_record["http_status"],
+        "Elapsed Seconds": first_record["elapsed_seconds"],
+    }
+    second_meta = {
+        "Name": second_record["execution_name"],
+        "Outcome": second_record["outcome"],
+        "Repository": second_record["repo_url"],
+        "Branch": second_record["branch"],
+        "Target Python": second_record["target_python_version"],
+        "HTTP": second_record["http_status"],
+        "Elapsed Seconds": second_record["elapsed_seconds"],
+    }
+    meta_columns = st.columns(2)
+    meta_columns[0].json(first_meta)
+    meta_columns[1].json(second_meta)
+
+    first_output = first_record.get("output_markdown") or ""
+    second_output = second_record.get("output_markdown") or ""
+
+    if first_output and second_output:
+        diff = "\n".join(
+            difflib.unified_diff(
+                first_output.splitlines(),
+                second_output.splitlines(),
+                fromfile=f"{first_record['execution_name']} {first_id[:8]}",
+                tofile=f"{second_record['execution_name']} {second_id[:8]}",
+                lineterm="",
+            )
+        )
+        st.write("**Markdown Output Diff**")
+        st.code(diff or "No Markdown differences.", language="diff")
+
+        output_columns = st.columns(2)
+        with output_columns[0].expander(
+            "First Markdown Output",
+            expanded=False,
+        ):
+            st.markdown(first_output)
+        with output_columns[1].expander(
+            "Second Markdown Output",
+            expanded=False,
+        ):
+            st.markdown(second_output)
+    else:
+        st.info(
+            "Markdown diff is available when both selected records have "
+            "stored Markdown output. Full workflow records often only "
+            "contain submission metadata."
+        )
+
+    with st.expander("First Request JSON", expanded=False):
+        st.json(first_record["request_json"])
+    with st.expander("Second Request JSON", expanded=False):
+        st.json(second_record["request_json"])
+    with st.expander("First Response JSON", expanded=False):
+        st.json(first_record["response_json"])
+    with st.expander("Second Response JSON", expanded=False):
+        st.json(second_record["response_json"])
+
+
 def run_execution_history_tab() -> None:
     """Render locally stored DuckDB execution history."""
     st.subheader("Execution History")
@@ -1339,6 +1844,8 @@ def run_execution_history_tab() -> None:
     }
     st.json(metadata)
 
+    render_rerun_controls(selected_record)
+
     request_json = selected_record["request_json"]
     response_json = selected_record["response_json"]
     request_download = json.dumps(
@@ -1400,6 +1907,9 @@ def run_execution_history_tab() -> None:
     if selected_record["error_message"]:
         st.write("**Stored Error Message**")
         st.error(selected_record["error_message"])
+
+    st.divider()
+    render_record_comparison(records)
 
 
 initialize_session_state()
